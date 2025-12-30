@@ -1,0 +1,674 @@
+#!/usr/bin/env python3
+"""
+GitHub Automation Tool - Professional Edition
+A comprehensive tool for GitHub automation with multiple modes.
+"""
+
+import requests
+import time
+import sys
+import os
+import logging
+from concurrent.futures import ThreadPoolExecutor, as_completed
+from threading import Lock
+from typing import Set, Dict, Optional, List, Tuple
+from datetime import datetime
+import signal
+import random
+import getpass
+
+# ANSI color codes
+class Colors:
+    GREEN = '\033[92m'
+    RED = '\033[91m'
+    YELLOW = '\033[93m'
+    BLUE = '\033[94m'
+    CYAN = '\033[96m'
+    MAGENTA = '\033[95m'
+    WHITE = '\033[97m'
+    RESET = '\033[0m'
+    BOLD = '\033[1m'
+    DIM = '\033[2m'
+
+class GitHubAutomation:
+    """Main GitHub automation class"""
+    
+    def __init__(self, token: str, log_to_file: bool = False):
+        self.token = token
+        self.headers = {
+            'Authorization': f'token {token}',
+            'Accept': 'application/vnd.github.v3+json',
+            'User-Agent': 'GitHub-Automation-Tool'
+        }
+        self.base_url = 'https://api.github.com'
+        self.authenticated_user = None
+        
+        # Statistics
+        self.stats = {
+            'followed': 0,
+            'starred': 0,
+            'skipped': 0,
+            'failed': 0,
+            'rate_limits': 0,
+            'pages_processed': 0,
+            'total_actions': 0
+        }
+        self.stats_lock = Lock()
+        self.processed_items: Set[str] = set()
+        self.shutdown_requested = False
+        
+        # Setup logging
+        self.setup_logging(log_to_file)
+        
+        # Setup signal handlers
+        signal.signal(signal.SIGINT, self.signal_handler)
+        signal.signal(signal.SIGTERM, self.signal_handler)
+    
+    def setup_logging(self, log_to_file: bool):
+        """Setup logging configuration"""
+        log_format = '%(asctime)s - %(levelname)s - %(message)s'
+        
+        if log_to_file:
+            log_filename = f'github_automation_{datetime.now().strftime("%Y%m%d_%H%M%S")}.log'
+            logging.basicConfig(
+                level=logging.INFO,
+                format=log_format,
+                handlers=[
+                    logging.FileHandler(log_filename),
+                    logging.StreamHandler(sys.stdout)
+                ]
+            )
+            self.log_file = log_filename
+        else:
+            logging.basicConfig(
+                level=logging.INFO,
+                format=log_format,
+                handlers=[logging.StreamHandler(sys.stdout)]
+            )
+            self.log_file = None
+    
+    def signal_handler(self, sig, frame):
+        """Handle shutdown signals"""
+        self.print_colored("\n\n⚠️  Shutdown signal received...", Colors.YELLOW)
+        logging.warning("Shutdown signal received")
+        self.shutdown_requested = True
+    
+    def print_colored(self, message: str, color: str = Colors.WHITE, prefix: str = ""):
+        """Print colored message"""
+        timestamp = datetime.now().strftime("%H:%M:%S")
+        print(f"{Colors.DIM}[{timestamp}]{Colors.RESET} {prefix}{color}{message}{Colors.RESET}")
+    
+    def print_header(self, text: str):
+        """Print formatted header"""
+        width = 70
+        print(f"\n{Colors.CYAN}{'='*width}{Colors.RESET}")
+        print(f"{Colors.BOLD}{Colors.CYAN}{text.center(width)}{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*width}{Colors.RESET}\n")
+    
+    def validate_token(self) -> bool:
+        """Validate GitHub token"""
+        try:
+            self.print_colored("Validating GitHub token...", Colors.BLUE, "🔐 ")
+            response = requests.get(
+                f'{self.base_url}/user',
+                headers=self.headers,
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                user_data = response.json()
+                self.authenticated_user = user_data.get('login', 'Unknown')
+                self.print_colored(
+                    f"Token validated! Authenticated as: {Colors.BOLD}{self.authenticated_user}{Colors.RESET}",
+                    Colors.GREEN,
+                    "✓ "
+                )
+                logging.info(f"Token validated for user: {self.authenticated_user}")
+                return True
+            elif response.status_code == 401:
+                self.print_colored("Invalid token! Please check your token.", Colors.RED, "✗ ")
+                logging.error("Token validation failed: 401 Unauthorized")
+                return False
+            else:
+                self.print_colored(f"Validation failed: HTTP {response.status_code}", Colors.RED, "✗ ")
+                logging.error(f"Token validation failed: {response.status_code}")
+                return False
+        except requests.exceptions.RequestException as e:
+            self.print_colored(f"Network error: {str(e)}", Colors.RED, "✗ ")
+            logging.error(f"Network error during validation: {str(e)}")
+            return False
+    
+    def check_rate_limit(self) -> Dict:
+        """Check rate limit status"""
+        try:
+            response = requests.get(
+                f'{self.base_url}/rate_limit',
+                headers=self.headers,
+                timeout=10
+            )
+            if response.status_code == 200:
+                data = response.json()
+                core = data.get('resources', {}).get('core', {})
+                return {
+                    'remaining': core.get('remaining', 0),
+                    'limit': core.get('limit', 0),
+                    'reset': core.get('reset', 0)
+                }
+        except Exception as e:
+            logging.error(f"Failed to check rate limit: {str(e)}")
+        return {'remaining': 0, 'limit': 0, 'reset': 0}
+    
+    def handle_rate_limit(self, retry_count: int = 0):
+        """Handle rate limit with waiting"""
+        with self.stats_lock:
+            self.stats['rate_limits'] += 1
+        
+        rate_info = self.check_rate_limit()
+        reset_time = rate_info.get('reset', 0)
+        
+        if reset_time:
+            wait_time = max(reset_time - time.time(), 0) + 10
+        else:
+            wait_time = min(600 * (2 ** retry_count), 1200)
+        
+        wait_minutes = int(wait_time / 60)
+        wait_seconds = int(wait_time % 60)
+        
+        self.print_colored(
+            f"Rate limit hit! Waiting {wait_minutes}m {wait_seconds}s...",
+            Colors.YELLOW,
+            "⏳ "
+        )
+        logging.warning(f"Rate limit hit. Waiting {wait_minutes}m {wait_seconds}s")
+        
+        for remaining in range(int(wait_time), 0, -30):
+            if self.shutdown_requested:
+                return
+            mins, secs = divmod(remaining, 60)
+            sys.stdout.write(f"\r{Colors.YELLOW}⏳ Time remaining: {mins}m {secs}s  {Colors.RESET}")
+            sys.stdout.flush()
+            time.sleep(min(30, remaining))
+        
+        print()
+        self.print_colored("Resuming operations...", Colors.GREEN, "▶ ")
+    
+    def follow_user(self, username: str) -> str:
+        """Follow a GitHub user"""
+        if username in self.processed_items or username == self.authenticated_user:
+            return 'skipped'
+        
+        url = f'{self.base_url}/user/following/{username}'
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries:
+            if self.shutdown_requested:
+                return 'interrupted'
+            
+            try:
+                response = requests.put(url, headers=self.headers, timeout=10)
+                
+                if response.status_code == 204:
+                    self.processed_items.add(username)
+                    logging.info(f"Followed: {username}")
+                    return 'success'
+                elif response.status_code == 403:
+                    self.handle_rate_limit(retry_count)
+                    retry_count += 1
+                elif response.status_code == 404:
+                    logging.warning(f"User not found: {username}")
+                    return 'not_found'
+                else:
+                    logging.error(f"Failed to follow {username}: {response.status_code}")
+                    return 'failed'
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Network error: {str(e)}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(2 ** retry_count)
+        
+        return 'failed'
+    
+    def star_repository(self, owner: str, repo: str) -> str:
+        """Star a repository"""
+        repo_full = f"{owner}/{repo}"
+        if repo_full in self.processed_items:
+            return 'skipped'
+        
+        url = f'{self.base_url}/user/starred/{owner}/{repo}'
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries:
+            if self.shutdown_requested:
+                return 'interrupted'
+            
+            try:
+                response = requests.put(url, headers=self.headers, timeout=10)
+                
+                if response.status_code == 204:
+                    self.processed_items.add(repo_full)
+                    logging.info(f"Starred: {repo_full}")
+                    return 'success'
+                elif response.status_code == 403:
+                    self.handle_rate_limit(retry_count)
+                    retry_count += 1
+                elif response.status_code == 404:
+                    logging.warning(f"Repo not found: {repo_full}")
+                    return 'not_found'
+                else:
+                    logging.error(f"Failed to star {repo_full}: {response.status_code}")
+                    return 'failed'
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Network error: {str(e)}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(2 ** retry_count)
+        
+        return 'failed'
+    
+    def fetch_random_users(self, count: int = 30, since: int = None) -> List[str]:
+        """Fetch random users"""
+        if since is None:
+            since = random.randint(0, 100000000)
+        
+        url = f'{self.base_url}/users'
+        params = {'since': since, 'per_page': count}
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if response.status_code == 200:
+                users = response.json()
+                return [user['login'] for user in users if user.get('login')]
+            elif response.status_code == 403:
+                self.handle_rate_limit()
+                return self.fetch_random_users(count, since)
+        except Exception as e:
+            logging.error(f"Failed to fetch users: {str(e)}")
+        
+        return []
+    
+    def fetch_trending_repos(self, language: str = None, count: int = 30) -> List[Tuple[str, str]]:
+        """Fetch trending repos"""
+        query = 'stars:>1000'
+        if language:
+            query += f' language:{language}'
+        
+        url = f'{self.base_url}/search/repositories'
+        params = {
+            'q': query,
+            'sort': 'stars',
+            'order': 'desc',
+            'per_page': count
+        }
+        
+        try:
+            response = requests.get(url, headers=self.headers, params=params, timeout=15)
+            if response.status_code == 200:
+                data = response.json()
+                repos = []
+                for repo in data.get('items', []):
+                    owner = repo.get('owner', {}).get('login')
+                    name = repo.get('name')
+                    if owner and name:
+                        repos.append((owner, name))
+                return repos
+            elif response.status_code == 403:
+                self.handle_rate_limit()
+                return self.fetch_trending_repos(language, count)
+        except Exception as e:
+            logging.error(f"Failed to fetch repos: {str(e)}")
+        
+        return []
+    
+    def get_repo_stargazers(self, owner: str, repo: str, page: int = 1, per_page: int = 100) -> Optional[List[str]]:
+        """Fetch stargazers"""
+        url = f'{self.base_url}/repos/{owner}/{repo}/stargazers'
+        params = {'page': page, 'per_page': per_page}
+        
+        retry_count = 0
+        max_retries = 3
+        
+        while retry_count < max_retries:
+            if self.shutdown_requested:
+                return None
+            
+            try:
+                response = requests.get(url, headers=self.headers, params=params, timeout=15)
+                
+                if response.status_code == 200:
+                    users = response.json()
+                    return [user['login'] for user in users if user.get('login')]
+                elif response.status_code == 403:
+                    self.handle_rate_limit(retry_count)
+                    retry_count += 1
+                elif response.status_code == 404:
+                    self.print_colored(f"Repository {owner}/{repo} not found!", Colors.RED, "✗ ")
+                    return None
+                else:
+                    logging.error(f"Failed to fetch stargazers: {response.status_code}")
+                    return None
+            except requests.exceptions.RequestException as e:
+                logging.error(f"Network error: {str(e)}")
+                retry_count += 1
+                if retry_count < max_retries:
+                    time.sleep(2 ** retry_count)
+        
+        return None
+    
+    def process_batch(self, items: List, action_type: str, workers: int, rest_time: int):
+        """Process batch with threading"""
+        with ThreadPoolExecutor(max_workers=workers) as executor:
+            futures = []
+            
+            for item in items:
+                if self.shutdown_requested:
+                    break
+                
+                if action_type == 'follow':
+                    future = executor.submit(self.follow_user, item)
+                elif action_type == 'star':
+                    owner, repo = item
+                    future = executor.submit(self.star_repository, owner, repo)
+                
+                futures.append((future, item))
+            
+            for future, item in futures:
+                if self.shutdown_requested:
+                    break
+                
+                try:
+                    result = future.result(timeout=30)
+                    
+                    with self.stats_lock:
+                        self.stats['total_actions'] += 1
+                        
+                        if result == 'success':
+                            if action_type == 'follow':
+                                self.stats['followed'] += 1
+                                self.print_colored(f"Followed: {item}", Colors.GREEN, "✓ ")
+                            else:
+                                self.stats['starred'] += 1
+                                if isinstance(item, tuple):
+                                    self.print_colored(f"Starred: {item[0]}/{item[1]}", Colors.GREEN, "⭐ ")
+                        elif result == 'skipped':
+                            self.stats['skipped'] += 1
+                        elif result == 'interrupted':
+                            pass
+                        else:
+                            self.stats['failed'] += 1
+                            if result != 'not_found':
+                                self.print_colored(f"Failed: {item}", Colors.RED, "✗ ")
+                
+                except Exception as e:
+                    with self.stats_lock:
+                        self.stats['failed'] += 1
+                    logging.error(f"Error: {str(e)}")
+        
+        if not self.shutdown_requested and rest_time > 0:
+            time.sleep(rest_time)
+    
+    def manual_mode(self):
+        """Manual mode"""
+        self.print_header("MANUAL MODE")
+        
+        print(f"{Colors.CYAN}Choose action:{Colors.RESET}")
+        print(f"  {Colors.WHITE}1.{Colors.RESET} Follow a user")
+        print(f"  {Colors.WHITE}2.{Colors.RESET} Star a repository")
+        
+        choice = input(f"\n{Colors.CYAN}Enter choice (1-2): {Colors.RESET}").strip()
+        
+        if choice == '1':
+            username = input(f"{Colors.CYAN}Enter username to follow: {Colors.RESET}").strip()
+            if username:
+                result = self.follow_user(username)
+                if result == 'success':
+                    self.print_colored(f"Successfully followed {username}!", Colors.GREEN, "✓ ")
+                elif result == 'skipped':
+                    self.print_colored(f"Already following {username}.", Colors.YELLOW, "⊘ ")
+                else:
+                    self.print_colored(f"Failed to follow {username}.", Colors.RED, "✗ ")
+        
+        elif choice == '2':
+            repo_input = input(f"{Colors.CYAN}Enter repository (owner/repo): {Colors.RESET}").strip()
+            if '/' in repo_input:
+                owner, repo = repo_input.split('/', 1)
+                result = self.star_repository(owner.strip(), repo.strip())
+                if result == 'success':
+                    self.print_colored(f"Successfully starred {owner}/{repo}!", Colors.GREEN, "⭐ ")
+                elif result == 'skipped':
+                    self.print_colored(f"Already starred {owner}/{repo}.", Colors.YELLOW, "⊘ ")
+                else:
+                    self.print_colored(f"Failed to star {owner}/{repo}.", Colors.RED, "✗ ")
+            else:
+                self.print_colored("Invalid format! Use: owner/repo", Colors.RED, "✗ ")
+    
+    def auto_follow_users(self, count: int, workers: int = 10, rest_time: int = 5):
+        """Auto follow users"""
+        self.print_header("AUTOMATIC USER FOLLOWING")
+        self.print_colored(f"Following up to {count} random users...", Colors.BLUE, "🚀 ")
+        
+        followed = 0
+        batch_size = min(30, count)
+        
+        while followed < count and not self.shutdown_requested:
+            users = self.fetch_random_users(batch_size)
+            if not users:
+                break
+            
+            users_to_follow = users[:min(len(users), count - followed)]
+            self.process_batch(users_to_follow, 'follow', workers, rest_time)
+            followed += len(users_to_follow)
+            
+            self.print_progress()
+    
+    def auto_star_repos(self, count: int, language: str = None, workers: int = 10, rest_time: int = 5):
+        """Auto star repos"""
+        self.print_header("AUTOMATIC REPOSITORY STARRING")
+        lang_str = f" ({language})" if language else ""
+        self.print_colored(f"Starring up to {count} repos{lang_str}...", Colors.BLUE, "🚀 ")
+        
+        repos = self.fetch_trending_repos(language, count)
+        if repos:
+            self.process_batch(repos, 'star', workers, rest_time)
+        
+        self.print_progress()
+    
+    def follow_repo_stargazers(self, owner: str, repo: str, workers: int = 10, rest_time: int = 5, batch_size: int = 50):
+        """Follow repo stargazers"""
+        self.print_header("FOLLOW REPOSITORY STARGAZERS")
+        self.print_colored(f"Following stargazers of {owner}/{repo}...", Colors.BLUE, "🚀 ")
+        
+        page = 1
+        while not self.shutdown_requested:
+            self.print_colored(f"Processing page {page}...", Colors.BLUE, "📄 ")
+            
+            stargazers = self.get_repo_stargazers(owner, repo, page)
+            if not stargazers:
+                break
+            
+            with self.stats_lock:
+                self.stats['pages_processed'] += 1
+            
+            for i in range(0, len(stargazers), batch_size):
+                if self.shutdown_requested:
+                    break
+                batch = stargazers[i:i + batch_size]
+                self.process_batch(batch, 'follow', workers, rest_time)
+            
+            self.print_progress()
+            page += 1
+    
+    def print_progress(self):
+        """Print progress"""
+        with self.stats_lock:
+            print(f"\n{Colors.BOLD}📊 Progress:{Colors.RESET}")
+            print(f"   {Colors.GREEN}Followed:{Colors.RESET} {self.stats['followed']} | "
+                  f"{Colors.MAGENTA}Starred:{Colors.RESET} {self.stats['starred']} | "
+                  f"{Colors.YELLOW}Skipped:{Colors.RESET} {self.stats['skipped']} | "
+                  f"{Colors.RED}Failed:{Colors.RESET} {self.stats['failed']}\n")
+    
+    def print_final_summary(self):
+        """Print final summary"""
+        self.print_header("FINAL SUMMARY")
+        
+        with self.stats_lock:
+            print(f"{Colors.GREEN}✓ Users Followed:{Colors.RESET}      {self.stats['followed']}")
+            print(f"{Colors.MAGENTA}⭐ Repos Starred:{Colors.RESET}      {self.stats['starred']}")
+            print(f"{Colors.YELLOW}⊘ Items Skipped:{Colors.RESET}      {self.stats['skipped']}")
+            print(f"{Colors.RED}✗ Actions Failed:{Colors.RESET}      {self.stats['failed']}")
+            print(f"{Colors.CYAN}⏳ Rate Limits:{Colors.RESET}        {self.stats['rate_limits']}")
+            print(f"{Colors.BLUE}📄 Pages Processed:{Colors.RESET}   {self.stats['pages_processed']}")
+            print(f"{Colors.WHITE}🎯 Total Actions:{Colors.RESET}     {self.stats['total_actions']}")
+        
+        if self.log_file:
+            print(f"\n{Colors.CYAN}📝 Log: {self.log_file}{Colors.RESET}")
+        
+        print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}\n")
+
+
+def get_token() -> str:
+    """Get token securely"""
+    print(f"\n{Colors.YELLOW}📝 GitHub Token Required{Colors.RESET}")
+    print(f"{Colors.DIM}   Token will NOT be stored{Colors.RESET}\n")
+    
+    try:
+        token = getpass.getpass(f"{Colors.CYAN}Enter token (hidden): {Colors.RESET}")
+    except:
+        token = input(f"{Colors.CYAN}Enter token: {Colors.RESET}")
+    
+    return token.strip()
+
+
+def show_token_instructions():
+    """Show token instructions"""
+    print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
+    print(f"{Colors.BOLD}  How to Create GitHub Token{Colors.RESET}")
+    print(f"{Colors.CYAN}{'='*70}{Colors.RESET}\n")
+    print(f"{Colors.WHITE}1.{Colors.RESET} Go to: https://github.com/settings/tokens")
+    print(f"{Colors.WHITE}2.{Colors.RESET} Click 'Generate new token (classic)'")
+    print(f"{Colors.WHITE}3.{Colors.RESET} Select scopes: user:follow, public_repo")
+    print(f"{Colors.WHITE}4.{Colors.RESET} Generate and copy token")
+    print(f"{Colors.CYAN}{'='*70}{Colors.RESET}\n")
+
+
+def main():
+    """Main entry"""
+    os.system('cls' if os.name == 'nt' else 'clear')
+    
+    print(f"\n{Colors.BOLD}{Colors.CYAN}{'='*70}{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}  GitHub Automation Tool{Colors.RESET}")
+    print(f"{Colors.BOLD}{Colors.CYAN}{'='*70}{Colors.RESET}\n")
+    
+    need_help = input(f"{Colors.CYAN}Need token help? (y/n): {Colors.RESET}").lower().strip()
+    if need_help == 'y':
+        show_token_instructions()
+    
+    max_attempts = 3
+    bot = None
+    
+    for attempt in range(max_attempts):
+        token = get_token()
+        
+        if not token:
+            print(f"{Colors.RED}✗ Token empty!{Colors.RESET}")
+            continue
+        
+        log_choice = input(f"{Colors.CYAN}Enable logging? (y/n): {Colors.RESET}").lower().strip()
+        log_to_file = log_choice == 'y'
+        
+        bot = GitHubAutomation(token, log_to_file)
+        
+        if bot.validate_token():
+            break
+        
+        if attempt < max_attempts - 1:
+            print(f"{Colors.YELLOW}Attempts left: {max_attempts - attempt - 1}{Colors.RESET}\n")
+    else:
+        print(f"{Colors.RED}✗ Max attempts exceeded{Colors.RESET}")
+        sys.exit(1)
+    
+    while not bot.shutdown_requested:
+        print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
+        print(f"{Colors.BOLD}  SELECT MODE{Colors.RESET}")
+        print(f"{Colors.CYAN}{'='*70}{Colors.RESET}\n")
+        
+        print(f"{Colors.WHITE}1.{Colors.RESET} Manual Mode")
+        print(f"{Colors.WHITE}2.{Colors.RESET} Auto Follow Users")
+        print(f"{Colors.WHITE}3.{Colors.RESET} Auto Star Repos")
+        print(f"{Colors.WHITE}4.{Colors.RESET} Follow Repo Stargazers")
+        print(f"{Colors.WHITE}5.{Colors.RESET} Check Rate Limit")
+        print(f"{Colors.WHITE}6.{Colors.RESET} Exit")
+        
+        choice = input(f"\n{Colors.CYAN}Choice (1-6): {Colors.RESET}").strip()
+        
+        try:
+            if choice == '1':
+                bot.manual_mode()
+            
+            elif choice == '2':
+                count = int(input(f"{Colors.CYAN}Users to follow (default=50): {Colors.RESET}") or "50")
+                workers = int(input(f"{Colors.CYAN}Workers (default=10): {Colors.RESET}") or "10")
+                rest = int(input(f"{Colors.CYAN}Rest time (default=5): {Colors.RESET}") or "5")
+                bot.auto_follow_users(count, workers, rest)
+            
+            elif choice == '3':
+                count = int(input(f"{Colors.CYAN}Repos to star (default=30): {Colors.RESET}") or "30")
+                lang = input(f"{Colors.CYAN}Language filter (optional): {Colors.RESET}").strip() or None
+                workers = int(input(f"{Colors.CYAN}Workers (default=10): {Colors.RESET}") or "10")
+                rest = int(input(f"{Colors.CYAN}Rest time (default=5): {Colors.RESET}") or "5")
+                bot.auto_star_repos(count, lang, workers, rest)
+            
+            elif choice == '4':
+                repo_input = input(f"{Colors.CYAN}Repository (owner/repo): {Colors.RESET}").strip()
+                if '/' in repo_input:
+                    owner, repo = repo_input.split('/', 1)
+                    workers = int(input(f"{Colors.CYAN}Workers (default=10): {Colors.RESET}") or "10")
+                    rest = int(input(f"{Colors.CYAN}Rest time (default=5): {Colors.RESET}") or "5")
+                    batch = int(input(f"{Colors.CYAN}Batch size (default=50): {Colors.RESET}") or "50")
+                    bot.follow_repo_stargazers(owner.strip(), repo.strip(), workers, rest, batch)
+                else:
+                    print(f"{Colors.RED}✗ Invalid format!{Colors.RESET}")
+            
+            elif choice == '5':
+                rate = bot.check_rate_limit()
+                print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
+                print(f"{Colors.BOLD}  RATE LIMIT{Colors.RESET}")
+                print(f"{Colors.CYAN}{'='*70}{Colors.RESET}\n")
+                print(f"{Colors.WHITE}Remaining:{Colors.RESET} {rate['remaining']}/{rate['limit']}")
+                if rate['reset']:
+                    reset_time = datetime.fromtimestamp(rate['reset']).strftime('%Y-%m-%d %H:%M:%S')
+                    print(f"{Colors.WHITE}Resets:{Colors.RESET} {reset_time}")
+                print(f"\n{Colors.CYAN}{'='*70}{Colors.RESET}")
+            
+            elif choice == '6':
+                print(f"\n{Colors.YELLOW}Exiting...{Colors.RESET}")
+                bot.shutdown_requested = True
+                break
+            
+            else:
+                print(f"{Colors.RED}✗ Invalid choice{Colors.RESET}")
+        
+        except ValueError:
+            print(f"{Colors.RED}✗ Invalid input{Colors.RESET}")
+        except KeyboardInterrupt:
+            print(f"\n{Colors.YELLOW}Interrupted{Colors.RESET}")
+            bot.shutdown_requested = True
+            break
+        except Exception as e:
+            print(f"{Colors.RED}✗ Error: {str(e)}{Colors.RESET}")
+            logging.error(f"Error: {str(e)}")
+    
+    bot.print_final_summary()
+    print(f"{Colors.GREEN}✓ Done!{Colors.RESET}\n")
+
+
+if __name__ == "__main__":
+    try:
+        import requests
+    except ImportError:
+        print(f"{Colors.RED}✗ 'requests' not found!{Colors.RESET}")
+        print(f"{Colors.YELLOW}Install: pip install requests{Colors.RESET}")
+        sys.exit(1)
+    
+    main()
